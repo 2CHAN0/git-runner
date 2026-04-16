@@ -19,7 +19,6 @@ jobs:
     name: Check Runner
     runs-on: ubuntu-latest
     outputs:
-      runner: ${{ steps.pick.outputs.runner }}
       is_self_hosted: ${{ steps.pick.outputs.is_self_hosted }}
     steps:
       - name: Check self-hosted runner availability
@@ -30,31 +29,92 @@ jobs:
           runners=$(gh api repos/${{ github.repository }}/actions/runners \
             --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null || echo "0")
           if [ "$runners" -gt 0 ]; then
-            echo "runner=self-hosted" >> $GITHUB_OUTPUT
             echo "is_self_hosted=true" >> $GITHUB_OUTPUT
             echo "✅ Self-hosted runner online ($runners available)"
           else
-            echo "runner=ubuntu-latest" >> $GITHUB_OUTPUT
             echo "is_self_hosted=false" >> $GITHUB_OUTPUT
             echo "⚠️ No self-hosted runner — falling back to GitHub hosted"
           fi
 
   # ──────────────────────────────────────────────
-  # 2. Install (캐시 + npm ci)
+  # 2-A. Self-hosted: 단일 job (오버헤드 최소화)
   # ──────────────────────────────────────────────
-  install:
-    name: Install
+  ci-self-hosted:
+    name: CI (self-hosted)
     needs: check-runner
-    runs-on: ${{ needs.check-runner.outputs.runner }}
-    outputs:
-      cache-key: ${{ steps.cache-key.outputs.key }}
+    if: needs.check-runner.outputs.is_self_hosted == 'true'
+    runs-on: self-hosted
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5433/test
+      DIRECT_URL: postgresql://test:test@localhost:5433/test
     steps:
-      - name: Clean workspace (self-hosted)
-        if: needs.check-runner.outputs.is_self_hosted == 'true'
+      - name: Clean workspace
         run: |
           rm -rf "$GITHUB_WORKSPACE"/*
           rm -rf "$GITHUB_WORKSPACE"/.??*
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Restore node_modules cache
+        id: cache-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Setup Node.js
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Run tests
+        run: npx vitest run
+
+      - name: Build
+        run: npx tsc --noEmit
+
+      - name: Start Postgres
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Setup database schema
+        run: npx prisma db push --skip-generate
+
+      - name: Run integration tests
+        run: npx vitest --config vitest.integration.config.mts
+
+      - name: Stop Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+      - name: Clean workspace
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
+  # ──────────────────────────────────────────────
+  # 2-B. Hosted fallback: 병렬 구조 (머신 여러 대)
+  # ──────────────────────────────────────────────
+  install:
+    name: Install
+    needs: check-runner
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -80,13 +140,11 @@ jobs:
         if: steps.cache-nm.outputs.cache-hit != 'true'
         run: npm ci --prefer-offline --no-audit --no-fund
 
-  # ──────────────────────────────────────────────
-  # 3. Test (2 shards 병렬 → 집계)
-  # ──────────────────────────────────────────────
   test-shard:
     name: Test (${{ matrix.shard }}/2)
     needs: [check-runner, install]
-    runs-on: ${{ needs.check-runner.outputs.runner }}
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -111,19 +169,18 @@ jobs:
 
   test:
     name: Test
-    needs: test-shard
+    needs: [check-runner, test-shard]
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Verify all shards passed
         run: echo "All test shards passed."
 
-  # ──────────────────────────────────────────────
-  # 4. Build
-  # ──────────────────────────────────────────────
   build:
     name: Build
     needs: [check-runner, install]
-    runs-on: ${{ needs.check-runner.outputs.runner }}
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -142,58 +199,7 @@ jobs:
       - name: Build
         run: npx tsc --noEmit
 
-  # ──────────────────────────────────────────────
-  # 5-A. Integration Tests (self-hosted: docker compose)
-  # ──────────────────────────────────────────────
-  integration-self-hosted:
-    name: Integration Tests
-    needs: [check-runner, install]
-    if: needs.check-runner.outputs.is_self_hosted == 'true'
-    runs-on: self-hosted
-    env:
-      DATABASE_URL: postgresql://test:test@localhost:5433/test
-      DIRECT_URL: postgresql://test:test@localhost:5433/test
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Restore node_modules cache
-        uses: actions/cache@v4
-        with:
-          path: node_modules
-          key: ${{ needs.install.outputs.cache-key }}
-
-      - name: Start Postgres (Docker Compose)
-        run: docker compose -f docker-compose.test.yml up -d --wait
-
-      - name: Generate Prisma client
-        run: npx prisma generate
-
-      - name: Setup database schema
-        run: npx prisma db push --skip-generate
-
-      - name: Run integration tests
-        run: npx vitest --config vitest.integration.config.mts
-
-      - name: Stop Postgres
-        if: always()
-        run: docker compose -f docker-compose.test.yml down -v
-
-      - name: Clean workspace
-        if: always()
-        run: |
-          rm -rf "$GITHUB_WORKSPACE"/*
-          rm -rf "$GITHUB_WORKSPACE"/.??*
-
-  # ──────────────────────────────────────────────
-  # 5-B. Integration Tests (hosted fallback: services)
-  # ──────────────────────────────────────────────
-  integration-hosted:
+  integration:
     name: Integration Tests
     needs: [check-runner, install]
     if: needs.check-runner.outputs.is_self_hosted == 'false'

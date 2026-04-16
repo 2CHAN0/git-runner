@@ -1,4 +1,4 @@
-name: Run Tests on Self-Hosted Runner
+name: Run Tests
 
 on:
   push:
@@ -7,9 +7,29 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    runs-on: self-hosted
+  check-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      use_self_hosted: ${{ steps.check.outputs.available }}
+    steps:
+      - name: Check self-hosted runner availability
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          runners=$(gh api repos/${{ github.repository }}/actions/runners --jq '[.runners[] | select(.status=="online")] | length')
+          if [ "$runners" -gt 0 ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "✅ Self-hosted runner online ($runners available)"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No self-hosted runner online, will fallback to GitHub hosted"
+          fi
 
+  test-self-hosted:
+    needs: check-runner
+    if: needs.check-runner.outputs.use_self_hosted == 'true'
+    runs-on: self-hosted
     steps:
       - name: Clean workspace
         run: |
@@ -42,3 +62,22 @@ jobs:
         run: |
           rm -rf "$GITHUB_WORKSPACE"/*
           rm -rf "$GITHUB_WORKSPACE"/.??*
+
+  test-hosted:
+    needs: check-runner
+    if: needs.check-runner.outputs.use_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short

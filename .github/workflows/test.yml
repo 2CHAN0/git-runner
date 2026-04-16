@@ -6,34 +6,13 @@ on:
   pull_request:
     branches: [main]
 
-permissions:
-  contents: read
-  actions: read
-
 jobs:
-  check-runner:
-    runs-on: ubuntu-latest
-    outputs:
-      use_self_hosted: ${{ steps.check.outputs.available }}
-    steps:
-      - name: Check self-hosted runner availability
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          runners=$(gh api repos/${{ github.repository }}/actions/runners --jq '[.runners[] | select(.status=="online")] | length')
-          if [ "$runners" -gt 0 ]; then
-            echo "available=true" >> $GITHUB_OUTPUT
-            echo "✅ Self-hosted runner online ($runners available)"
-          else
-            echo "available=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No self-hosted runner online, will fallback to GitHub hosted"
-          fi
-
   test-self-hosted:
-    needs: check-runner
-    if: needs.check-runner.outputs.use_self_hosted == 'true'
     runs-on: self-hosted
+    timeout-minutes: 5
+    continue-on-error: true
+    outputs:
+      result: ${{ steps.test.outcome }}
     steps:
       - name: Clean workspace
         run: |
@@ -57,6 +36,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
+        id: test
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -v --tb=short
@@ -67,9 +47,9 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE"/*
           rm -rf "$GITHUB_WORKSPACE"/.??*
 
-  test-hosted:
-    needs: check-runner
-    if: needs.check-runner.outputs.use_self_hosted == 'false'
+  test-hosted-fallback:
+    needs: test-self-hosted
+    if: needs.test-self-hosted.result == 'failure' || needs.test-self-hosted.outputs.result != 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

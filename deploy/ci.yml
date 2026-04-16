@@ -1,0 +1,286 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+    types: [labeled, synchronize]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to run tests on'
+        required: false
+
+# Cancel in-progress runs for the same ref to save Actions minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Runner 상태 확인 → 동적 분기
+  # ──────────────────────────────────────────────
+  check-runner:
+    name: Check Runner
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.action == 'labeled' && (github.event.label.name == 'run-tests' || github.event.label.name == 'auto-merge')) ||
+      (github.event_name == 'pull_request' && github.event.action == 'synchronize' && (contains(github.event.pull_request.labels.*.name, 'run-tests') || contains(github.event.pull_request.labels.*.name, 'auto-merge')))
+    outputs:
+      is_self_hosted: ${{ steps.pick.outputs.is_self_hosted }}
+    steps:
+      - name: Check self-hosted runner availability
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+        run: |
+          runners=$(gh api repos/${{ github.repository }}/actions/runners \
+            --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null || echo "0")
+          if [ "$runners" -gt 0 ]; then
+            echo "is_self_hosted=true" >> $GITHUB_OUTPUT
+            echo "✅ Self-hosted runner online ($runners available)"
+          else
+            echo "is_self_hosted=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No self-hosted runner — falling back to GitHub hosted"
+          fi
+
+  # ──────────────────────────────────────────────
+  # 2-A. Self-hosted: 단일 job (오버헤드 최소화)
+  # ──────────────────────────────────────────────
+  ci-self-hosted:
+    name: CI (self-hosted)
+    needs: check-runner
+    if: needs.check-runner.outputs.is_self_hosted == 'true'
+    runs-on: self-hosted
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: https://dummy.supabase.co
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: dummy-anon-key
+      DATABASE_URL: postgresql://test:test@localhost:5433/test
+      DIRECT_URL: postgresql://test:test@localhost:5433/test
+      RESEND_API_KEY: re_dummy_key
+    steps:
+      - name: Clean workspace
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Restore node_modules cache
+        id: cache-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json', 'prisma/schema.prisma', 'patches/**') }}
+
+      - name: Setup Node.js
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      # ── Unit Tests ──
+      - name: Run tests
+        run: npm test
+
+      # ── Build ──
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('**/*.[jt]s', '**/*.[jt]sx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+
+      - name: Build
+        run: npm run build
+
+      # ── Integration Tests (Docker Compose) ──
+      - name: Start Postgres
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Setup database schema
+        run: npx prisma db push --skip-generate
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      - name: Stop Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+      - name: Clean workspace
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
+  # ──────────────────────────────────────────────
+  # 2-B. Hosted fallback: 병렬 구조 (기존 파이프라인)
+  # ──────────────────────────────────────────────
+  install:
+    name: Install
+    needs: check-runner
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute cache key
+        id: cache-key
+        run: echo "key=node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json', 'prisma/schema.prisma', 'patches/**') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore node_modules cache
+        id: cache-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Setup Node.js
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+  test-shard:
+    name: Test (${{ matrix.shard }}/2)
+    needs: [check-runner, install]
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Run tests (shard ${{ matrix.shard }}/2)
+        run: npm test -- --shard=${{ matrix.shard }}/2
+
+  # Aggregator job named "Test" so auto-merge.yml's `^Test:success$` check still works.
+  test:
+    name: Test
+    needs: [check-runner, test-shard, ci-self-hosted]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify tests passed
+        run: |
+          if [ "${{ needs.ci-self-hosted.result }}" = "success" ] || [ "${{ needs.test-shard.result }}" = "success" ]; then
+            echo "All tests passed."
+          else
+            echo "Tests failed or were not run."
+            exit 1
+          fi
+
+  build:
+    name: Build
+    needs: [check-runner, install]
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    env:
+      NEXT_PUBLIC_SUPABASE_URL: https://dummy.supabase.co
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: dummy-anon-key
+      DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      DIRECT_URL: postgresql://dummy:dummy@localhost:5432/dummy
+      RESEND_API_KEY: re_dummy_key
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Cache Next.js build
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('**/*.[jt]s', '**/*.[jt]sx') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+
+      - name: Build
+        run: npm run build
+
+  integration:
+    name: Integration Tests
+    needs: [check-runner, install]
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5433:5432
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5433/test
+      DIRECT_URL: postgresql://test:test@localhost:5433/test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Setup database schema
+        run: npx prisma db push --skip-generate
+
+      - name: Run integration tests
+        run: npm run test:integration

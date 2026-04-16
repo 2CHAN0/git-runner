@@ -1,5 +1,5 @@
 import pytest
-from app.calculator import add, subtract, multiply, divide
+from app.calculator import add, subtract, multiply, divide, power, modulo
 
 
 class TestAdd:
@@ -39,3 +39,26 @@ class TestDivide:
     def test_divide_by_zero(self):
         with pytest.raises(ValueError, match="Cannot divide by zero"):
             divide(1, 0)
+
+
+class TestPower:
+    def test_basic(self):
+        assert power(2, 3) == 8
+
+    def test_zero_exponent(self):
+        assert power(5, 0) == 1
+
+    def test_negative_exponent(self):
+        assert power(2, -1) == 0.5
+
+
+class TestModulo:
+    def test_basic(self):
+        assert modulo(10, 3) == 1
+
+    def test_even_division(self):
+        assert modulo(10, 5) == 0
+
+    def test_modulo_by_zero(self):
+        with pytest.raises(ValueError, match="Cannot modulo by zero"):
+            modulo(10, 0)

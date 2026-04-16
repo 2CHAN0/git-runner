@@ -11,8 +11,15 @@ jobs:
     runs-on: self-hosted
 
     steps:
+      - name: Clean workspace
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          clean: true
 
       - name: Set up Python
         run: |
@@ -29,3 +36,9 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest tests/ -v --tb=short
+
+      - name: Clean workspace
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*

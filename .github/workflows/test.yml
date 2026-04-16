@@ -1,4 +1,4 @@
-name: Run Tests on Self-Hosted Runner
+name: CI
 
 on:
   push:
@@ -6,26 +6,235 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  test:
-    runs-on: self-hosted
+# Cancel in-progress runs for the same ref to save Actions minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+jobs:
+  # ──────────────────────────────────────────────
+  # 1. Runner 상태 확인 → 동적 분기
+  # ──────────────────────────────────────────────
+  check-runner:
+    name: Check Runner
+    runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.pick.outputs.runner }}
+      is_self_hosted: ${{ steps.pick.outputs.is_self_hosted }}
     steps:
-      - name: Checkout code
+      - name: Check self-hosted runner availability
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_TOKEN }}
+        run: |
+          runners=$(gh api repos/${{ github.repository }}/actions/runners \
+            --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null || echo "0")
+          if [ "$runners" -gt 0 ]; then
+            echo "runner=self-hosted" >> $GITHUB_OUTPUT
+            echo "is_self_hosted=true" >> $GITHUB_OUTPUT
+            echo "✅ Self-hosted runner online ($runners available)"
+          else
+            echo "runner=ubuntu-latest" >> $GITHUB_OUTPUT
+            echo "is_self_hosted=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No self-hosted runner — falling back to GitHub hosted"
+          fi
+
+  # ──────────────────────────────────────────────
+  # 2. Install (캐시 + npm ci)
+  # ──────────────────────────────────────────────
+  install:
+    name: Install
+    needs: check-runner
+    runs-on: ${{ needs.check-runner.outputs.runner }}
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Clean workspace (self-hosted)
+        if: needs.check-runner.outputs.is_self_hosted == 'true'
+        run: |
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        run: |
-          python3 -m venv .venv
-          source .venv/bin/activate
-          echo "$VIRTUAL_ENV/bin" >> $GITHUB_PATH
+      - name: Compute cache key
+        id: cache-key
+        run: echo "key=node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore node_modules cache
+        id: cache-nm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Setup Node.js
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
-        run: |
-          source .venv/bin/activate
-          pip install -r requirements.txt
+        if: steps.cache-nm.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
 
-      - name: Run tests
+  # ──────────────────────────────────────────────
+  # 3. Test (2 shards 병렬 → 집계)
+  # ──────────────────────────────────────────────
+  test-shard:
+    name: Test (${{ matrix.shard }}/2)
+    needs: [check-runner, install]
+    runs-on: ${{ needs.check-runner.outputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Run tests (shard ${{ matrix.shard }}/2)
+        run: npx vitest run --shard=${{ matrix.shard }}/2
+
+  test:
+    name: Test
+    needs: test-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all shards passed
+        run: echo "All test shards passed."
+
+  # ──────────────────────────────────────────────
+  # 4. Build
+  # ──────────────────────────────────────────────
+  build:
+    name: Build
+    needs: [check-runner, install]
+    runs-on: ${{ needs.check-runner.outputs.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Build
+        run: npx tsc --noEmit
+
+  # ──────────────────────────────────────────────
+  # 5-A. Integration Tests (self-hosted: docker compose)
+  # ──────────────────────────────────────────────
+  integration-self-hosted:
+    name: Integration Tests
+    needs: [check-runner, install]
+    if: needs.check-runner.outputs.is_self_hosted == 'true'
+    runs-on: self-hosted
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5433/test
+      DIRECT_URL: postgresql://test:test@localhost:5433/test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Start Postgres (Docker Compose)
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Setup database schema
+        run: npx prisma db push --skip-generate
+
+      - name: Run integration tests
+        run: npx vitest --config vitest.integration.config.mts
+
+      - name: Stop Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+      - name: Clean workspace
+        if: always()
         run: |
-          source .venv/bin/activate
-          python -m pytest tests/ -v --tb=short
+          rm -rf "$GITHUB_WORKSPACE"/*
+          rm -rf "$GITHUB_WORKSPACE"/.??*
+
+  # ──────────────────────────────────────────────
+  # 5-B. Integration Tests (hosted fallback: services)
+  # ──────────────────────────────────────────────
+  integration-hosted:
+    name: Integration Tests
+    needs: [check-runner, install]
+    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5433:5432
+    env:
+      DATABASE_URL: postgresql://test:test@localhost:5433/test
+      DIRECT_URL: postgresql://test:test@localhost:5433/test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Setup database schema
+        run: npx prisma db push --skip-generate
+
+      - name: Run integration tests
+        run: npx vitest --config vitest.integration.config.mts

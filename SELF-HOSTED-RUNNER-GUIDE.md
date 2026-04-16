@@ -252,68 +252,23 @@ gh api repos/<owner>/<repo>/actions/runners \
 # 출력: { "name": "local-macbook", "status": "online" }
 ```
 
-확인되면 `.github/workflows/ci.yml`을 아래 구조로 교체:
+확인되면 교체:
 
-```yaml
-jobs:
-  # [신규] Runner 상태 확인
-  check-runner:
-    runs-on: ubuntu-latest
-    outputs:
-      is_self_hosted: ${{ steps.pick.outputs.is_self_hosted }}
-    steps:
-      - id: pick
-        env:
-          GH_TOKEN: ${{ secrets.RUNNER_TOKEN }}
-        run: |
-          runners=$(gh api repos/${{ github.repository }}/actions/runners \
-            --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null || echo "0")
-          if [ "$runners" -gt 0 ]; then
-            echo "is_self_hosted=true" >> $GITHUB_OUTPUT
-          else
-            echo "is_self_hosted=false" >> $GITHUB_OUTPUT
-          fi
-
-  # [신규] Self-hosted 단일 job — 오버헤드 최소화
-  ci-self-hosted:
-    needs: check-runner
-    if: needs.check-runner.outputs.is_self_hosted == 'true'
-    runs-on: self-hosted
-    steps:
-      - # clean workspace
-      - # checkout
-      - # npm ci (캐시)
-      - # npm test
-      - # npm run build
-      - # docker compose up (Postgres)
-      - # prisma db push
-      - # npm run test:integration
-      - # docker compose down
-      - # clean workspace
-
-  # [기존 유지] Hosted fallback — 기존 ci.yml 구조 그대로
-  install:
-    needs: check-runner
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
-    runs-on: ubuntu-latest
-    # ... 기존 install job 그대로
-
-  test-shard:
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
-    # ... 기존 test-shard 그대로
-
-  build:
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
-    # ... 기존 build 그대로
-
-  integration:
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
-    # ... 기존 integration 그대로 (services: postgres 사용)
+```bash
+# creator-docsend 리포 디렉토리에서:
+cp deploy/ci.yml .github/workflows/ci.yml
+git add .github/workflows/ci.yml
+git commit -m "Switch CI to self-hosted runner with hosted fallback"
+git push
 ```
 
 #### auto-merge.yml
 
 변경 불필요. auto-merge는 GitHub API만 사용하므로 runner 유형과 무관하다.
+
+#### Test aggregator와 auto-merge 호환
+
+기존 `auto-merge.yml`이 `Test` job의 성공 여부로 머지를 판단한다. 교체된 ci.yml의 `test` job은 self-hosted 경로와 hosted 경로 양쪽의 결과를 모두 확인하므로, auto-merge와의 호환성이 유지된다.
 
 ---
 
@@ -392,3 +347,36 @@ cd ~/actions-runner
 | Check Runner에서 403 에러 | RUNNER_TOKEN 만료 | Admin이 PAT 재생성 후 secret 갱신 |
 | Integration 테스트 실패 | Docker Desktop 미실행 | 맥북 A에서 Docker Desktop 실행 확인 |
 | Job이 queued 상태에서 안 움직임 | runner가 다른 job 처리 중 | 대기 (1대이므로 순차 처리) |
+
+---
+
+## deploy 파일 목록
+
+`deploy/` 디렉토리에 실행에 필요한 모든 파일이 준비되어 있다.
+
+| 파일 | 용도 | 실행 주체 |
+|------|------|----------|
+| `deploy/ci.yml` | creator-docsend용 완성된 교체 CI 워크플로우 | Admin |
+| `deploy/setup-admin.sh` | Admin 초기 설정 스크립트 (secret 등록, 등록 토큰 발급) | Admin |
+| `deploy/setup-runner.sh` | 맥북 A Runner 설치 스크립트 (다운로드, 등록, 서비스 시작) | 맥북 A 담당자 |
+
+### 실행 순서
+
+```bash
+# ① Admin이 실행 (GitHub CLI 로그인된 상태)
+./deploy/setup-admin.sh ireneshlee814/creator-docsend
+#    → RUNNER_TOKEN secret 등록
+#    → Runner 등록 토큰 발급 → 맥북 A에 전달
+
+# ② 맥북 A 담당자가 실행 (GitHub 로그인 불필요)
+./deploy/setup-runner.sh ireneshlee814/creator-docsend <등록토큰>
+#    → Node.js/Docker 확인
+#    → Runner 다운로드, 등록, 서비스 시작
+
+# ③ Admin이 Runner 온라인 확인 후 ci.yml 교체
+cd <creator-docsend 디렉토리>
+cp <이 리포>/deploy/ci.yml .github/workflows/ci.yml
+git add .github/workflows/ci.yml
+git commit -m "Switch CI to self-hosted runner with hosted fallback"
+git push
+```

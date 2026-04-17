@@ -20,6 +20,8 @@ concurrency:
 jobs:
   # ──────────────────────────────────────────────
   # 1. Runner 상태 확인 → 동적 분기
+  #    기존 ci.yml의 install job에 있던 label/event 조건을 여기로 이동.
+  #    이 job이 스킵되면 downstream 전체가 스킵된다.
   # ──────────────────────────────────────────────
   check-runner:
     name: Check Runner
@@ -48,18 +50,21 @@ jobs:
           fi
 
   # ──────────────────────────────────────────────
-  # 2-A. Self-hosted: 단일 job (오버헤드 최소화)
+  # 2-A. Self-hosted: 단일 job에서 install→test→build→integration 순차 실행
+  #
+  #      continue-on-error: true
+  #      → 어떤 step에서든 실패해도 workflow는 계속 진행되어
+  #        아래 fallback job들이 실행된다.
   # ──────────────────────────────────────────────
   ci-self-hosted:
     name: CI (self-hosted)
     needs: check-runner
     if: needs.check-runner.outputs.is_self_hosted == 'true'
     runs-on: self-hosted
+    continue-on-error: true
     env:
       NEXT_PUBLIC_SUPABASE_URL: https://dummy.supabase.co
       NEXT_PUBLIC_SUPABASE_ANON_KEY: dummy-anon-key
-      DATABASE_URL: postgresql://test:test@localhost:5433/test
-      DIRECT_URL: postgresql://test:test@localhost:5433/test
       RESEND_API_KEY: re_dummy_key
     steps:
       - name: Clean workspace
@@ -72,6 +77,7 @@ jobs:
         with:
           clean: true
 
+      # ── Install ──
       - name: Restore node_modules cache
         id: cache-nm
         uses: actions/cache@v4
@@ -94,7 +100,7 @@ jobs:
       - name: Run tests
         run: npm test
 
-      # ── Build ──
+      # ── Build (env는 기존 ci.yml build job과 동일하게 dummy 값 사용) ──
       - name: Cache Next.js build
         uses: actions/cache@v4
         with:
@@ -104,16 +110,25 @@ jobs:
             nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
 
       - name: Build
+        env:
+          DATABASE_URL: postgresql://dummy:dummy@localhost:5432/dummy
+          DIRECT_URL: postgresql://dummy:dummy@localhost:5432/dummy
         run: npm run build
 
-      # ── Integration Tests (Docker Compose) ──
+      # ── Integration Tests (Docker Compose로 Postgres) ──
       - name: Start Postgres
         run: docker compose -f docker-compose.test.yml up -d --wait
 
       - name: Setup database schema
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5433/test
+          DIRECT_URL: postgresql://test:test@localhost:5433/test
         run: npx prisma db push --skip-generate
 
       - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5433/test
+          DIRECT_URL: postgresql://test:test@localhost:5433/test
         run: npm run test:integration
 
       - name: Stop Postgres
@@ -127,12 +142,22 @@ jobs:
           rm -rf "$GITHUB_WORKSPACE"/.??*
 
   # ──────────────────────────────────────────────
-  # 2-B. Hosted fallback: 병렬 구조 (기존 파이프라인)
+  # 2-B. Hosted fallback (기존 ci.yml 병렬 파이프라인 그대로)
+  #
+  #      아래 job들의 fallback 조건:
+  #        - self-hosted runner 부재 (is_self_hosted == 'false')
+  #        - 또는 self-hosted 실행 실패 (ci-self-hosted.result != 'success')
+  #
+  #      self-hosted 성공 시에는 모두 스킵된다.
   # ──────────────────────────────────────────────
   install:
     name: Install
-    needs: check-runner
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    needs: [check-runner, ci-self-hosted]
+    if: |
+      always() && !cancelled() &&
+      needs.check-runner.result == 'success' &&
+      (needs.check-runner.outputs.is_self_hosted == 'false' ||
+       needs.ci-self-hosted.result != 'success')
     runs-on: ubuntu-latest
     outputs:
       cache-key: ${{ steps.cache-key.outputs.key }}
@@ -164,8 +189,10 @@ jobs:
 
   test-shard:
     name: Test (${{ matrix.shard }}/2)
-    needs: [check-runner, install]
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    needs: [check-runner, ci-self-hosted, install]
+    if: |
+      always() && !cancelled() &&
+      needs.install.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -189,26 +216,12 @@ jobs:
       - name: Run tests (shard ${{ matrix.shard }}/2)
         run: npm test -- --shard=${{ matrix.shard }}/2
 
-  # Aggregator job named "Test" so auto-merge.yml's `^Test:success$` check still works.
-  test:
-    name: Test
-    needs: [check-runner, test-shard, ci-self-hosted]
-    if: always() && !cancelled()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Verify tests passed
-        run: |
-          if [ "${{ needs.ci-self-hosted.result }}" = "success" ] || [ "${{ needs.test-shard.result }}" = "success" ]; then
-            echo "All tests passed."
-          else
-            echo "Tests failed or were not run."
-            exit 1
-          fi
-
   build:
     name: Build
-    needs: [check-runner, install]
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    needs: [check-runner, ci-self-hosted, install]
+    if: |
+      always() && !cancelled() &&
+      needs.install.result == 'success'
     runs-on: ubuntu-latest
     env:
       NEXT_PUBLIC_SUPABASE_URL: https://dummy.supabase.co
@@ -244,8 +257,10 @@ jobs:
 
   integration:
     name: Integration Tests
-    needs: [check-runner, install]
-    if: needs.check-runner.outputs.is_self_hosted == 'false'
+    needs: [check-runner, ci-self-hosted, install]
+    if: |
+      always() && !cancelled() &&
+      needs.install.result == 'success'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -284,3 +299,45 @@ jobs:
 
       - name: Run integration tests
         run: npm run test:integration
+
+  # ──────────────────────────────────────────────
+  # 3. Aggregator
+  #
+  #    자동 머지(auto-merge.yml)가 branch protection의 required status
+  #    check로 이 "Test" job 이름을 본다. 이 job은 다음 두 경로 중 하나가
+  #    성공했는지를 확인한다:
+  #      A) ci-self-hosted 성공
+  #      B) ci-self-hosted 실패/부재 → fallback(test-shard + build + integration) 성공
+  # ──────────────────────────────────────────────
+  test:
+    name: Test
+    needs: [check-runner, ci-self-hosted, test-shard, build, integration]
+    if: always() && !cancelled() && needs.check-runner.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify pipeline result
+        run: |
+          SELF="${{ needs.ci-self-hosted.result }}"
+          SHARD="${{ needs.test-shard.result }}"
+          BUILD="${{ needs.build.result }}"
+          INTEG="${{ needs.integration.result }}"
+
+          echo "ci-self-hosted: $SELF"
+          echo "test-shard:     $SHARD"
+          echo "build:          $BUILD"
+          echo "integration:    $INTEG"
+
+          # Path A: self-hosted succeeded (fallback jobs skipped)
+          if [ "$SELF" = "success" ]; then
+            echo "✅ Passed on self-hosted runner"
+            exit 0
+          fi
+
+          # Path B: fallback jobs all succeeded
+          if [ "$SHARD" = "success" ] && [ "$BUILD" = "success" ] && [ "$INTEG" = "success" ]; then
+            echo "✅ Passed on GitHub hosted runner (fallback)"
+            exit 0
+          fi
+
+          echo "❌ Pipeline failed"
+          exit 1
